@@ -52,14 +52,16 @@ It supports training with:
     with `--use-transducer False --use-ctc True --use-attention-decoder True`
 """
 
-
 import argparse
 import copy
+import sys
 import logging
 import warnings
 from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple, Union
+
+sys.path.append('')
 
 import k2
 import optim
@@ -67,7 +69,6 @@ import sentencepiece as spm
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
-from asr_datamodule import LibriSpeechAsrDataModule
 from attention_decoder import AttentionDecoderModel
 from decoder import Decoder
 from joiner import Joiner
@@ -103,8 +104,19 @@ from icefall.utils import (
     str2bool,
 )
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
+
+# * These classes are used to adjust the learning rate during training according to a predefined schedule.
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
+
+'''
+These functions together help manage and synchronize batch counts in a distributed training environment, 
+ensuring consistency and proper tracking of training progress.
+'''
 
 def get_adjusted_batch_count(params: AttributeDict) -> float:
     # returns the number of batches we would have used so far if we had used the reference
@@ -126,8 +138,24 @@ def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
         if hasattr(module, "name"):
             module.name = name
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
+
+'''
+ 
+- Function called add_model_arguments that adds various command-line arguments to an argparse.ArgumentParser object.
+
+- These arguments are used to configure the architecture and hyperparameters of a Zipformer encoder model.
+
+This function allows for a high degree of customization and experimentation with the Zipformer model by setting 
+various hyperparameters and architectural choices through command-line arguments.
+
+'''
 
 def add_model_arguments(parser: argparse.ArgumentParser):
+
+    # ---- ENCODER ----
+
     parser.add_argument(
         "--num-encoder-layers",
         type=str,
@@ -207,6 +235,8 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         "a single int or comma-separated list.",
     )
 
+    # ---- DECODER ----
+
     parser.add_argument(
         "--decoder-dim",
         type=int,
@@ -259,6 +289,8 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="""Feedforward dimension used in attention decoder""",
     )
 
+    # ---- ADDITIONAL CONFIGURATIONS ----
+
     parser.add_argument(
         "--causal",
         type=str2bool,
@@ -304,11 +336,27 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="If True, use attention-decoder head.",
     )
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
+
+'''
+
+Function called get_parser() that sets up a command-line argument parser using the argparse module.
+
+The function then adds multiple arguments to the parser, each corresponding to a specific configuration parameter for the training script.
+
+'''
 
 def get_parser():
+
+    # Initializes an ArgumentParser object with a custom formatter class (argparse.ArgumentDefaultsHelpFormatter) 
+    # that automatically includes default values in the help messages.
+
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
+
+    # ---- General Training Configuration ----
 
     parser.add_argument(
         "--world-size",
@@ -374,6 +422,8 @@ def get_parser():
         help="Path to the BPE model",
     )
 
+    # ---- Learning Rate Configuration ----
+
     parser.add_argument(
         "--base-lr", type=float, default=0.045, help="The base learning rate."
     )
@@ -394,6 +444,8 @@ def get_parser():
         """,
     )
 
+    # ---- Batch and Context Configuration ----
+
     parser.add_argument(
         "--ref-duration",
         type=float,
@@ -408,6 +460,8 @@ def get_parser():
         default=2,
         help="The context size in the decoder. 1 means bigram; " "2 means tri-gram",
     )
+
+    # ---- Loss Function Configuration ----
 
     parser.add_argument(
         "--prune-range",
@@ -456,6 +510,8 @@ def get_parser():
         help="Scale for attention-decoder loss.",
     )
 
+    # ---- Miscellaneous Configuration ----
+
     parser.add_argument(
         "--seed",
         type=int,
@@ -476,6 +532,8 @@ def get_parser():
         default=False,
         help="Add hooks to check for infinite module outputs and gradients.",
     )
+
+    # ---- Checkpointing Configuration ----
 
     parser.add_argument(
         "--save-every-n",
@@ -525,6 +583,8 @@ def get_parser():
 
     return parser
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
 
 def get_params() -> AttributeDict:
     """Return a dict containing training parameters.
@@ -590,10 +650,21 @@ def get_params() -> AttributeDict:
 
     return params
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
 
 def _to_int_tuple(s: str):
     return tuple(map(int, s.split(",")))
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
+
+'''
+
+    - get_encoder_embed: Creates an embedding module that subsamples and embeds the input sequence.
+    - get_encoder_model: Creates the main encoder model using the Zipformer2 architecture, with various configurable parameters for downsampling, attention, and feedforward layers.
+
+'''
 
 def get_encoder_embed(params: AttributeDict) -> nn.Module:
     # encoder_embed converts the input of shape (N, T, num_features)
@@ -613,7 +684,7 @@ def get_encoder_embed(params: AttributeDict) -> nn.Module:
 
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
-    encoder = Zipformer2(
+    encoder = Zipformer2( # * Custom encoder model 
         output_downsampling_factor=2,
         downsampling_factor=_to_int_tuple(params.downsampling_factor),
         num_encoder_layers=_to_int_tuple(params.num_encoder_layers),
@@ -634,6 +705,8 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
     )
     return encoder
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
 
 def get_decoder_model(params: AttributeDict) -> nn.Module:
     decoder = Decoder(
@@ -644,9 +717,21 @@ def get_decoder_model(params: AttributeDict) -> nn.Module:
     )
     return decoder
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
+
+'''
+
+    The Joiner class is designed to integrate the information from both the encoder and decoder. 
+    In models like RNN-T, the joiner takes the high-level features from the encoder (which has 
+    processed the input sequence) and the decoder (which has processed the output sequence so far) 
+    and combines them to produce a probability distribution over the next possible tokens in the 
+    sequence.
+
+'''
 
 def get_joiner_model(params: AttributeDict) -> nn.Module:
-    joiner = Joiner(
+    joiner = Joiner( # * Used in architectures like the Recurrent Neural Network Transducer (RNN-T)
         encoder_dim=max(_to_int_tuple(params.encoder_dim)),
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
@@ -654,9 +739,11 @@ def get_joiner_model(params: AttributeDict) -> nn.Module:
     )
     return joiner
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
 
 def get_attention_decoder_model(params: AttributeDict) -> nn.Module:
-    decoder = AttentionDecoderModel(
+    decoder = AttentionDecoderModel( # * Decode the encoded representations into the output sequence using attention mechanisms
         vocab_size=params.vocab_size,
         decoder_dim=params.attention_decoder_dim,
         num_decoder_layers=params.attention_decoder_num_layers,
@@ -671,6 +758,8 @@ def get_attention_decoder_model(params: AttributeDict) -> nn.Module:
     )
     return decoder
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
 
 def get_model(params: AttributeDict) -> nn.Module:
     assert params.use_transducer or params.use_ctc, (
@@ -709,6 +798,8 @@ def get_model(params: AttributeDict) -> nn.Module:
     )
     return model
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
 
 def load_checkpoint_if_available(
     params: AttributeDict,
@@ -775,6 +866,14 @@ def load_checkpoint_if_available(
 
     return saved_params
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
+
+'''
+
+    Comprehensive utility for saving the state of a training process in PyTorch.
+
+'''
 
 def save_checkpoint(
     params: AttributeDict,
@@ -825,6 +924,16 @@ def save_checkpoint(
         best_valid_filename = params.exp_dir / "best-valid-loss.pt"
         copyfile(src=filename, dst=best_valid_filename)
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
+
+'''
+
+    - The compute_loss function calculates the total loss for the Zipformer model by aggregating multiple loss components, including transducer, 
+    CTC, and attention decoder losses. It handles the necessary preprocessing steps, such as moving data to the appropriate device and tokenizing text data. 
+    The function also scales the loss components based on the current training step and tracks various metrics related to the loss computation.
+
+'''
 
 def compute_loss(
     params: AttributeDict,
@@ -852,20 +961,22 @@ def compute_loss(
         values >= 1.0 are fully warmed up and have all modules present.
     """
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
-    feature = batch["inputs"]
+    feature = batch["inputs"] # * Inputs
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
     feature = feature.to(device)
 
-    supervisions = batch["supervisions"]
+    supervisions = batch["supervisions"] # * Predictions
     feature_lens = supervisions["num_frames"].to(device)
 
     batch_idx_train = params.batch_idx_train
     warm_step = params.warm_step
 
-    texts = batch["supervisions"]["text"]
-    y = sp.encode(texts, out_type=int)
-    y = k2.RaggedTensor(y)
+    texts = batch["supervisions"]["text"] # * Texts from predictions
+    y = sp.encode(texts, out_type=int) # * Tokenized using the SentencePiece processor
+    # * A k2.RaggedTensor is a specialized data structure used in the k2 library, designed to 
+    # * handle irregularly shaped data, such as lists of lists where the inner lists can have different lengths.
+    y = k2.RaggedTensor(y)  
 
     with torch.set_grad_enabled(is_training):
         simple_loss, pruned_loss, ctc_loss, attention_decoder_loss = model(
@@ -893,7 +1004,7 @@ def compute_loss(
                 if batch_idx_train >= warm_step
                 else 0.1 + 0.9 * (batch_idx_train / warm_step)
             )
-            loss += simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
+            loss += simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss # * TOTAL LOSS
 
         if params.use_ctc:
             loss += params.ctc_loss_scale * ctc_loss
@@ -920,6 +1031,8 @@ def compute_loss(
 
     return loss, info
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
 
 def compute_validation_loss(
     params: AttributeDict,
@@ -941,19 +1054,21 @@ def compute_validation_loss(
             batch=batch,
             is_training=False,
         )
-        assert loss.requires_grad is False
+        assert loss.requires_grad is False # Asserts that the computed loss does not require gradients
         tot_loss = tot_loss + loss_info
 
     if world_size > 1:
         tot_loss.reduce(loss.device)
 
-    loss_value = tot_loss["loss"] / tot_loss["frames"]
+    loss_value = tot_loss["loss"] / tot_loss["frames"] # Average loss per frame
     if loss_value < params.best_valid_loss:
         params.best_valid_epoch = params.cur_epoch
         params.best_valid_loss = loss_value
 
     return tot_loss
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
 
 def train_one_epoch(
     params: AttributeDict,
@@ -1019,7 +1134,10 @@ def train_one_epoch(
             rank=0,
         )
 
-    for batch_idx, batch in enumerate(train_dl):
+    # !                                     TRAIN LOOP
+    # ! -------------------------------------------------------------------------------------
+
+    for batch_idx, batch in enumerate(train_dl): # * Training loop
         if batch_idx % 10 == 0:
             set_batch_count(model, get_adjusted_batch_count(params))
 
@@ -1028,6 +1146,8 @@ def train_one_epoch(
 
         try:
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
+                #  * ---- Loss Computation ----
+
                 loss, loss_info = compute_loss(
                     params=params,
                     model=model,
@@ -1037,6 +1157,8 @@ def train_one_epoch(
                 )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
+
+            # * ---- Backward Pass and Optimization ----
 
             # NOTE: We use reduction==sum and loss is computed over utterances
             # in the batch and there is no normalization to it so far.
@@ -1050,6 +1172,9 @@ def train_one_epoch(
             logging.info(
                 f"Caught exception: {e}."
             )
+
+    # ! -------------------------------------------------------------------------------------
+
             save_bad_model()
             display_and_save_batch(batch, params=params, sp=sp)
             raise
@@ -1133,6 +1258,9 @@ def train_one_epoch(
                         "train/grad_scale", cur_grad_scale, params.batch_idx_train
                     )
 
+        # !                                    VALIDATION
+        # ! -------------------------------------------------------------------------------------
+
         if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
             logging.info("Computing validation loss")
             valid_info = compute_validation_loss(
@@ -1152,12 +1280,16 @@ def train_one_epoch(
                     tb_writer, "train/valid_", params.batch_idx_train
                 )
 
+        # ! -------------------------------------------------------------------------------------
+
     loss_value = tot_loss["loss"] / tot_loss["frames"]
     params.train_loss = loss_value
     if params.train_loss < params.best_train_loss:
         params.best_train_epoch = params.cur_epoch
         params.best_train_loss = params.train_loss
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
 
 def run(rank, world_size, args):
     """
@@ -1171,10 +1303,10 @@ def run(rank, world_size, args):
       args:
         The return value of get_parser().parse_args()
     """
-    params = get_params()
-    params.update(vars(args))
+    params = get_params() # Retrieves the training parameters
+    params.update(vars(args)) # Updates the parameters with the command-line arguments
 
-    fix_random_seed(params.seed)
+    fix_random_seed(params.seed) # Sets the random seed for reproducibility
     if world_size > 1:
         setup_dist(rank, world_size, params.master_port)
 
@@ -1186,11 +1318,14 @@ def run(rank, world_size, args):
     else:
         tb_writer = None
 
+    # ---- Device setup ----
     device = torch.device("cpu")
     if torch.cuda.is_available():
         device = torch.device("cuda", rank)
     logging.info(f"Device: {device}")
+    # ----------------------
 
+    # ---- SentencePiece processor ----
     sp = spm.SentencePieceProcessor()
     sp.load(params.bpe_model)
 
@@ -1198,6 +1333,7 @@ def run(rank, world_size, args):
     params.blank_id = sp.piece_to_id("<blk>")
     params.sos_id = params.eos_id = sp.piece_to_id("<sos/eos>")
     params.vocab_size = sp.get_piece_size()
+    # ---------------------------------
 
     if not params.use_transducer:
         if not params.use_attention_decoder:
@@ -1210,7 +1346,7 @@ def run(rank, world_size, args):
     logging.info(params)
 
     logging.info("About to create model")
-    model = get_model(params)
+    model = get_model(params) # Creates the model for training
 
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
@@ -1231,6 +1367,7 @@ def run(rank, world_size, args):
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
+    # ---- Optimizer and Scheduler ----
     optimizer = ScaledAdam(
         get_parameter_groups_with_lrs(model, lr=params.base_lr, include_names=True),
         lr=params.base_lr,  # should have no effect
@@ -1238,8 +1375,9 @@ def run(rank, world_size, args):
     )
 
     scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
+    # ---------------------------------
 
-    if checkpoints and "optimizer" in checkpoints:
+    if checkpoints and "optimzer" in checkpoints:
         logging.info("Loading optimizer state dict")
         optimizer.load_state_dict(checkpoints["optimizer"])
 
@@ -1313,8 +1451,6 @@ def run(rank, world_size, args):
 
         return True
 
-    train_cuts = train_cuts.filter(remove_short_and_long_utt)
-
     if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
         # We only load the sampler's state dict when it loads a checkpoint
         # saved in the middle of an epoch
@@ -1322,9 +1458,38 @@ def run(rank, world_size, args):
     else:
         sampler_state_dict = None
 
+    # ! ---- THIS IS WHAT HAS TO BE ADAPTED FOR ALL THE BASQUE DATASETS ----
     train_dl = librispeech.train_dataloaders(
         train_cuts, sampler_state_dict=sampler_state_dict
     )
+
+    # * ---------------------------------------------------------------------
+
+    for batch_idx, batch in enumerate(train_dl):
+        print(f"Batch {batch_idx + 1}:")
+        
+        # Print the type and shape of each item in the batch
+        for key, value in batch.items():
+            print(f"  {key}:")
+            if isinstance(value, torch.Tensor):
+                print(f"    Type: {type(value)}, Shape: {value.shape}")
+            elif isinstance(value, list):
+                print(f"    Type: {type(value)}, Length: {len(value)}")
+                if len(value) > 0 and isinstance(value[0], torch.Tensor):
+                    print(f"    Element Type: {type(value[0])}, Element Shape: {value[0].shape}")
+            else:
+                print(f"    Type: {type(value)}")
+        
+        # Print a separator for readability
+        print("-" * 50)
+        
+        # Optionally, break after the first few batches to avoid too much output
+        if batch_idx >= 2:
+            break
+
+    # * ---------------------------------------------------------------------
+
+    sys.exit() # Exit the program
 
     valid_cuts = librispeech.dev_clean_cuts()
     valid_cuts += librispeech.dev_other_cuts()
@@ -1343,6 +1508,8 @@ def run(rank, world_size, args):
     if checkpoints and "grad_scaler" in checkpoints:
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
+
+    # ! ---- Training Loop ----
 
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)
@@ -1384,12 +1551,16 @@ def run(rank, world_size, args):
             rank=rank,
         )
 
+    # ! -----------------------
+
     logging.info("Done!")
 
     if world_size > 1:
         torch.distributed.barrier()
         cleanup_dist()
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
 
 def display_and_save_batch(
     batch: dict,
@@ -1464,23 +1635,27 @@ def scan_pessimistic_batches_for_oom(
             f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
         )
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
 
 def main():
-    parser = get_parser()
+    parser = get_parser() # This function defines the command-line arguments that the script accepts
     LibriSpeechAsrDataModule.add_arguments(parser)
-    args = parser.parse_args()
+    args = parser.parse_args() # Parses the command-line arguments and stores them in the args variable
     args.exp_dir = Path(args.exp_dir)
 
-    world_size = args.world_size
-    assert world_size >= 1
+    world_size = args.world_size # Retrieves the number of GPUs to be used for distributed training
+    assert world_size >= 1 # Ensures that at least one GPU is specified
     if world_size > 1:
         mp.spawn(run, args=(world_size, args), nprocs=world_size, join=True)
     else:
         run(rank=0, world_size=1, args=args)
 
+# ----------------------------------------------------------------------------------
+# ----------------------------------------------------------------------------------
 
-torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
+torch.set_num_threads(1) # Reduce contention and improve performance in some cases
+torch.set_num_interop_threads(1) # Sets the number of threads used for inter-op parallelism to 1
 
 if __name__ == "__main__":
     main()
